@@ -1,4 +1,4 @@
-"use strict";
+"use strict"; 
 
 /**
  * User OTP auth:
@@ -48,8 +48,12 @@ function randomOtp() {
   return String(Math.floor(Math.random() * 10 ** OTP_LEN)).padStart(OTP_LEN, "0");
 }
 
-async function getActiveSmtpTransport() {
-  const cfg = await SmtpConfig.findOne({ isActive: true });
+/**
+ * SMTP কনফিগ রেজলভ করে একটাই ট্রান্সপোর্টার বানায়।
+ * - SMTP কন্ট্রোলার যেহেতু একটাই রেকর্ড রাখে (latest), তাই এখানে isActive লাগবে না।
+ */
+async function getActiveSmtpTransport(existingCfg) {
+  const cfg = existingCfg || (await SmtpConfig.findOne().sort({ createdAt: -1 }));
   if (!cfg) {
     const err = new Error("SMTP not configured");
     err.status = 422;
@@ -59,8 +63,8 @@ async function getActiveSmtpTransport() {
   const transporter = nodemailer.createTransport({
     host: cfg.host,
     port: Number(cfg.port),
-    secure: Number(cfg.port) === 465,
-    auth: { user: cfg.username, pass: cfg.getPassword() },
+    secure: Number(cfg.port) === 465, // 465 => true, 587/25 => false
+    auth: { user: cfg.username, pass: cfg.password }, // <<== এখানে মূল ফিক্স
     connectionTimeout: 8000
   });
   return transporter;
@@ -93,16 +97,16 @@ export default {
       return res.json({ ok: true });
     }
 
-    // Guard: SMTP configured?
-    const active = await SmtpConfig.findOne({ isActive: true });
-    if (!active) return res.status(422).json({ ok: false, code: 422, message: "SMTP not configured" });
+    // SMTP কনফিগ আছে কি? (latest one)
+    const cfg = await SmtpConfig.findOne().sort({ createdAt: -1 });
+    if (!cfg) return res.status(422).json({ ok: false, code: 422, message: "SMTP not configured" });
 
     // Rate limits:
     const ip = req.ip;
     const now = Date.now();
 
     // per email cooldown
-    const until = (global.__otpCooldown.get(email) || 0);
+    const until = global.__otpCooldown.get(email) || 0;
     if (until > now) return res.json({ ok: true }); // uniform
 
     // per IP hourly
@@ -118,8 +122,8 @@ export default {
 
     // Send email
     try {
-      const transporter = await getActiveSmtpTransport();
-      const from = active.username;
+      const transporter = await getActiveSmtpTransport(cfg);
+      const from = cfg.username; // sender যতটা সম্ভব verified/allowed
       await transporter.sendMail({
         from,
         to: email,
@@ -128,6 +132,13 @@ export default {
         html: `<p>Your OTP is <b>${code}</b>. It expires in 3 minutes.</p>`
       });
     } catch (e) {
+      // ডিবাগে সাহায্যের জন্য সামান্য লগ (ইচ্ছে হলে রেখে দেবে)
+      console.error("[SMTP sendMail error]", {
+        name: e?.name, code: e?.code, responseCode: e?.responseCode,
+        command: e?.command, message: e?.message
+      });
+      // ইমেইল না গেলে আগে ইস্যু করা OTP মুছে ফেলি (ghost OTP এড়াতে)
+      try { global.__otpStore.delete(email); } catch {}
       return res.status(503).json({ ok: false, code: 503, message: "SMTP temporarily unavailable" });
     }
 
@@ -231,19 +242,14 @@ export default {
       return res.status(401).json({ ok: false, code: 401, message: "CSRF failed" });
     }
 
-    const auth = req.auth; // from authUser middleware if you choose to protect; here we'll just rely on tokens if used
-    // Expect Authorization Bearer to be used for identity in client app when calling this
-    // For simplicity, delete by email param too (optional):
+    const auth = req.auth;
     const email = normalizeEmail(req.body?.email);
     let user = null;
     if (email) user = await User.findOne({ email });
     if (!user && auth?.sub) user = await User.findById(auth.sub);
     if (!user) return res.status(404).json({ ok: false, code: 404, message: "User not found" });
 
-    // revoke all sessions
     await revokeAllSessionsForSubject(user._id, "user");
-    // cleanup user media best-effort (picture path is stored if any)
-    // Picture removal handled in profile controller; here we just delete the row
     await User.deleteOne({ _id: user._id });
 
     clearRefreshCookie(res);
