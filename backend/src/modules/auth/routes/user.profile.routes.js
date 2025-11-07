@@ -1,29 +1,55 @@
 "use strict";
 
+/**
+ * User Profile Routes
+ * Field-level routes for authenticated users to manage their own profile.
+ *
+ *   /user/profile/name
+ *   /user/profile/picture
+ *   /user/profile/address
+ *   /user/profile/mobile
+ */
+
 import { Router } from "express";
 import { authUser } from "../../../middlewares/authUser.js";
 import { upload } from "../../../config/multer.js";
-import UserProfileController from "../controllers/UserProfileController.js";
 
-const r = Router();
 
-/**
- * /user/profile/*
- */
-r.get("/name", authUser, UserProfileController.getName);
-r.patch("/name", authUser, UserProfileController.setName);
-r.delete("/name", authUser, UserProfileController.clearName);
+import {
+  getName,
+  setName,
+  clearName,
+  getPicture,
+  setPicture,
+  clearPicture,
+  getAddress,
+  setAddress,
+  clearAddress,
+  getMobile,
+  setMobile,
+  clearMobile
+} from "../controllers/UserProfileController.js";
 
-r.get("/picture", authUser, UserProfileController.getPicture);
-r.patch("/picture", authUser, upload.single("picture"), UserProfileController.setPicture);
-r.delete("/picture", authUser, UserProfileController.clearPicture);
+const router = Router();
 
-r.get("/address", authUser, UserProfileController.getAddress);
-r.patch("/address", authUser, UserProfileController.setAddress);
-r.delete("/address", authUser, UserProfileController.clearAddress);
+/* ------------------------------ NAME ------------------------------ */
+router.get("/name", authUser, getName);
+router.patch("/name", authUser, setName);
+router.delete("/name", authUser, clearName);
 
-r.get("/mobile", authUser, UserProfileController.getMobile);
-r.patch("/mobile", authUser, UserProfileController.setMobile);
-r.delete("/mobile", authUser, UserProfileController.clearMobile);
+/* ----------------------------- PICTURE ----------------------------- */
+router.get("/picture", authUser, getPicture);
+router.patch("/picture", authUser, upload.single("picture"), setPicture);
+router.delete("/picture", authUser, clearPicture);
 
-export default r;
+/* ----------------------------- ADDRESS ----------------------------- */
+router.get("/address", authUser, getAddress);
+router.patch("/address", authUser, setAddress);
+router.delete("/address", authUser, clearAddress);
+
+/* ------------------------------ MOBILE ----------------------------- */
+router.get("/mobile", authUser, getMobile);
+router.patch("/mobile", authUser, setMobile);
+router.delete("/mobile", authUser, clearMobile);
+
+export default router;

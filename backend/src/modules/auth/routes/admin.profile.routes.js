@@ -1,24 +1,37 @@
 "use strict";
 
+/**
+ * Admin Profile Routes
+ * Field-level routes for admin profile management.
+ *
+ * /admin/profile/name      -> GET (read), PATCH (update), DELETE (clear)
+ * /admin/profile/picture   -> GET (read), PATCH (upload), DELETE (remove)
+ */
+
 import { Router } from "express";
 import { upload } from "../../../config/multer.js";
 import { authAdmin } from "../../../middlewares/authAdmin.js";
-import AdminProfileController from "../controllers/AdminProfileController.js";
 
-const r = Router();
+// ⬇️ Import named controller functions
+import {
+  getName,
+  setName,
+  clearName,
+  getPicture,
+  setPicture,
+  clearPicture
+} from "../controllers/AdminProfileController.js";
 
-/**
- * /admin/profile/name
- */
-r.get("/name", authAdmin, AdminProfileController.getName);
-r.patch("/name", authAdmin, AdminProfileController.setName);
-r.delete("/name", authAdmin, AdminProfileController.clearName);
+const router = Router();
 
-/**
- * /admin/profile/picture
- */
-r.get("/picture", authAdmin, AdminProfileController.getPicture);
-r.patch("/picture", authAdmin, upload.single("picture"), AdminProfileController.setPicture);
-r.delete("/picture", authAdmin, AdminProfileController.clearPicture);
+/* ------------------------------ NAME ------------------------------ */
+router.get("/name", authAdmin, getName);
+router.patch("/name", authAdmin, setName);
+router.delete("/name", authAdmin, clearName);
 
-export default r;
+/* ----------------------------- PICTURE ----------------------------- */
+router.get("/picture", authAdmin, getPicture);
+router.patch("/picture", authAdmin, upload.single("picture"), setPicture);
+router.delete("/picture", authAdmin, clearPicture);
+
+export default router;

@@ -1,11 +1,11 @@
 "use strict";
 
-/**
- * Admin auth
- * - login via ENV ADMIN_EMAIL + ADMIN_PASSWORD
- * - refresh with CSRF (cookie + header)
- * - logout revokes current sid
- */
+/* ----------------------------------------------------------
+  Admin login / refresh / logout
+  - credentials live in .env  (ADMIN_EMAIL, ADMIN_PASSWORD)
+  - refresh token stored in http-only cookie  (name = rt)
+  - CSRF double-submit cookie vs header
+---------------------------------------------------------- */
 
 import bcrypt from "bcryptjs";
 import Admin from "../models/Admin.js";
@@ -18,132 +18,198 @@ import {
   clearRefreshCookie
 } from "../../../utils/jwt.js";
 
+/* ---------- tiny helpers -------------------------------- */
 const CSRF_COOKIE = process.env.CSRF_COOKIE_NAME || "csrf";
 const CSRF_HEADER = process.env.CSRF_HEADER_NAME || "X-CSRF-Token";
 
-function sameSiteSecure() {
-  return (process.env.COOKIE_SECURE === "true") || process.env.NODE_ENV === "production";
+function isSecureCookie() {
+  return (
+    process.env.COOKIE_SECURE === "true" ||
+    process.env.NODE_ENV === "production"
+  );
 }
 
-function assertCsrf(req) {
+/* ---------- CSRF guard ----------------------------------- */
+function guardCsrf(req) {
   const cookie = req.cookies[CSRF_COOKIE];
   const header = req.headers[CSRF_HEADER.toLowerCase()];
   if (!cookie || !header || cookie !== header) {
-    const err = new Error("CSRF validation failed");
+    const err = new Error("CSRF mismatch");
     err.status = 401;
     throw err;
   }
 }
 
-export default {
-  // POST /admin/auth/login
-  async login(req, res) {
-    // ✅ Step 1: Validate input
-    const { email, password } = req.body || {};
-    if (typeof email !== "string" || typeof password !== "string") {
-      return res.status(400).json({ ok: false, code: 400, message: "Invalid input" });
+/* ---------- simple in-memory rate limiter -------------- */
+const loginAttempts = new Map(); // ip → { fails, lockedUntil }
+
+function isIpLocked(ip) {
+  const record = loginAttempts.get(ip);
+  if (!record) return false;
+  if (Date.now() < record.lockedUntil) return true;
+  loginAttempts.delete(ip); // lock expired
+  return false;
+}
+
+function registerFail(ip) {
+  const record = loginAttempts.get(ip) || { fails: 0, lockedUntil: 0 };
+  record.fails += 1;
+  if (record.fails >= 5) {
+    record.fails = 0;
+    record.lockedUntil = Date.now() + 15 * 60 * 1000; // 15 min
+  }
+  loginAttempts.set(ip, record);
+}
+
+function registerSuccess(ip) {
+  loginAttempts.delete(ip);
+}
+
+/* ---- tiny hash for lookup ------------------------------ */
+function quickHash(str) {
+  let h = 0;
+  for (let i = 0; i < str.length; i++)
+    h = (Math.imul(h, 31) + str.charCodeAt(i)) | 0;
+  return String(h);
+}
+
+/* ========================================================= */
+/*                     CONTROLLERS                           */
+/* ========================================================= */
+
+// 🔹 POST /admin/auth/login
+export async function login(req, res) {
+  try {
+    const email = req.body?.email?.trim().toLowerCase();
+    const password = req.body?.password;
+
+    // Validate input
+    if (!email || !password) {
+      return res.status(400).json({
+        ok: false,
+        message: "Email and password required"
+      });
     }
 
-    // ✅ Step 2: Compare with ENV
-    const ADMIN_EMAIL = process.env.ADMIN_EMAIL;
-    const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-    const emailOk = email.toLowerCase().trim() === String(ADMIN_EMAIL).toLowerCase().trim();
+    // Rate limit check
+    if (isIpLocked(req.ip)) {
+      return res.status(429).json({
+        ok: false,
+        message: "Too many attempts – try later"
+      });
+    }
 
-    // We allow ADMIN_PASSWORD to be plain or bcrypt hash for runtime comparison
-    let passOk = false;
-    if (ADMIN_PASSWORD?.startsWith("$2a$") || ADMIN_PASSWORD?.startsWith("$2b$")) {
-      passOk = await bcrypt.compare(password, ADMIN_PASSWORD);
+    // 1️⃣ Compare email
+    const envEmail = process.env.ADMIN_EMAIL?.trim().toLowerCase();
+    if (email !== envEmail) {
+      registerFail(req.ip);
+      return res.status(401).json({ ok: false, message: "Bad credentials" });
+    }
+
+    // 2️⃣ Compare password
+    const envPassword = process.env.ADMIN_PASSWORD;
+    let passwordOK = false;
+
+    if (envPassword?.startsWith("$2a$") || envPassword?.startsWith("$2b$")) {
+      passwordOK = await bcrypt.compare(password, envPassword);
     } else {
-      passOk = password === ADMIN_PASSWORD;
+      passwordOK = password === envPassword;
     }
 
-    // ✅ Step 3: Rate limits (basic per-IP lock)
-    // (Simple in-memory; for production, use Redis)
-    const ip = req.ip;
-    if (!global.__adminLoginRL) global.__adminLoginRL = new Map();
-    const rl = global.__adminLoginRL.get(ip) || { fails: 0, until: 0 };
-    const now = Date.now();
-    if (rl.until > now) {
-      return res.status(429).json({ ok: false, code: 429, message: "Too many attempts. Try later." });
+    if (!passwordOK) {
+      registerFail(req.ip);
+      return res.status(401).json({ ok: false, message: "Bad credentials" });
     }
 
-    if (!emailOk || !passOk) {
-      rl.fails += 1;
-      if (rl.fails >= 5) {
-        rl.until = now + 15 * 60 * 1000; // 15 min lock
-        rl.fails = 0;
-      }
-      global.__adminLoginRL.set(ip, rl);
-      return res.status(401).json({ ok: false, code: 401, message: "Invalid credentials" });
-    }
-    // reset on success
-    global.__adminLoginRL.delete(ip);
+    // Reset rate limiter
+    registerSuccess(req.ip);
 
-    // ✅ Step 4: Ensure admin profile row exists (for name/picture)
-    const emailNorm = ADMIN_EMAIL.toLowerCase().trim();
-    let admin = await Admin.findOne({ email: emailNorm });
-    if (!admin) {
-      admin = await Admin.create({ email: emailNorm });
-    }
+    // 3️⃣ Ensure admin record exists
+    let admin = await Admin.findOne({ email: envEmail });
+    if (!admin) admin = await Admin.create({ email: envEmail });
 
-    // ✅ Step 5: Session + tokens
-    const access = signAccessToken(admin._id, "admin");
-    const { sid, token: refresh } = await createSession({
+    // 4️⃣ Create session + tokens
+    const accessToken = signAccessToken(admin._id, "admin");
+    const { sid, token: refreshToken } = await createSession({
       subjectId: admin._id,
       role: "admin",
       userAgent: req.headers["user-agent"],
       ip: req.ip
     });
 
-    setRefreshCookie(res, refresh);
+    // 🍪 Set refresh token cookie
+    setRefreshCookie(res, refreshToken);
 
-    return res.json({
-      ok: true,
-      accessToken: access,
-      sid
+    return res.json({ ok: true, accessToken, sid });
+  } catch (err) {
+    console.error("Error in login():", err);
+    return res.status(err?.status || 500).json({
+      ok: false,
+      code: err?.status || 500,
+      message: err?.message || "Failed to login"
     });
-  },
+  }
+}
 
-  // POST /admin/auth/refresh
-  async refresh(req, res) {
-    assertCsrf(req);
-    const rt = req.cookies?.rt;
-    if (!rt) return res.status(401).json({ ok: false, code: 401, message: "Unauthorized" });
+// 🔹 POST /admin/auth/refresh
+export async function refresh(req, res) {
+  try {
+    guardCsrf(req);
 
-    const { newSid, newToken, payload } = await rotateSession(rt, {
+    const oldRefreshToken = req.cookies.rt;
+    if (!oldRefreshToken) {
+      return res
+        .status(401)
+        .json({ ok: false, message: "Missing refresh token" });
+    }
+
+    const { newSid, newToken, payload } = await rotateSession(oldRefreshToken, {
       userAgent: req.headers["user-agent"],
       ip: req.ip
     });
 
     setRefreshCookie(res, newToken);
 
-    const access = signAccessToken(payload.sub, "admin");
-    return res.json({ ok: true, accessToken: access, sid: newSid });
-  },
+    const accessToken = signAccessToken(payload.sub, "admin");
 
-  // POST /admin/auth/logout
-  async logout(req, res) {
-    assertCsrf(req);
-    const rt = req.cookies?.rt;
-    if (!rt) {
-      clearRefreshCookie(res);
-      return res.json({ ok: true });
-    }
-    // revoke by sid
-    try {
-      const row = await RefreshToken.findOne({ tokenHash: String(hash(rt)) });
+    return res.json({ ok: true, accessToken, sid: newSid });
+  } catch (err) {
+    console.error("Error in refresh():", err);
+    return res.status(err?.status || 500).json({
+      ok: false,
+      code: err?.status || 500,
+      message: err?.message || "Failed to refresh token"
+    });
+  }
+}
+
+// 🔹 POST /admin/auth/logout
+export async function logout(req, res) {
+  try {
+    guardCsrf(req);
+
+    const refreshToken = req.cookies.rt;
+    if (refreshToken) {
+      const hashed = quickHash(refreshToken);
+      const row = await RefreshToken.findOne({ tokenHash: hashed });
+
       if (row?.sid) {
-        await RefreshToken.updateOne({ sid: row.sid }, { $set: { revokedAt: new Date() } });
+        await RefreshToken.updateMany(
+          { sid: row.sid },
+          { $set: { revokedAt: new Date() } }
+        );
       }
-    } catch { /* ignore */ }
+    }
+
     clearRefreshCookie(res);
     return res.json({ ok: true });
+  } catch (err) {
+    console.error("Error in logout():", err);
+    return res.status(err?.status || 500).json({
+      ok: false,
+      code: err?.status || 500,
+      message: err?.message || "Failed to logout"
+    });
   }
-};
-
-// lightweight hash for sid lookup
-function hash(t) {
-  let h = 0;
-  for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
-  return h;
 }
+   
